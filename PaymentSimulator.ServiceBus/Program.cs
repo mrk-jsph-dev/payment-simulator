@@ -1,6 +1,13 @@
-﻿using Microsoft.Extensions.Hosting;
+﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using PaymentSimulator.ServiceBus.Gateway;
 
 var builder = Host.CreateDefaultBuilder(args);
+
+builder.ConfigureServices(services =>
+{
+    services.AddSingleton<IPaymentGateway, SimulatedPaymentGateway>();
+});
 
 builder.UseNServiceBus(context =>
 {
