@@ -18,3 +18,16 @@ Content-Type: application/json
   "reference": "ORDER-67890"
 }
 ###
+
+### Declined card (test card ending 0002)
+Post {{PaymentSimulator.Api_HostAddress}}/api/payment/submit
+Content-Type: application/json
+{
+  "paymentId": "6f9619ff-8b86-d011-b42d-00c04fc964ff",
+  "amount": 50.00,
+  "currency": "PHP",
+  "paymentMethod": { "type": "CreditCard", "cardLast4": "0002", "cardBrand": "Visa" },
+  "customer": { "customerId": "CUST-12345", "email": "jane.doe@example.com" },
+  "reference": "ORDER-67891"
+}
+###

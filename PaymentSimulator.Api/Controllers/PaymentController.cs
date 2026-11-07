@@ -1,6 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using PaymentSimulator.Api.Contracts;
-using PaymentSimulator.Events;
+using PaymentSimulator.Api.Payments;
 
 namespace PaymentSimulator.API.Controllers;
 
@@ -8,32 +8,28 @@ namespace PaymentSimulator.API.Controllers;
 [ApiController]
 public class PaymentController : ControllerBase
 {
-    private readonly IMessageSession _messageSession;
-    private readonly ILogger<PaymentController> _logger;
+    private readonly PaymentSubmitter _submitter;
 
-    public PaymentController(IMessageSession messageSession, ILogger<PaymentController> logger)
+    public PaymentController(PaymentSubmitter submitter)
     {
-        _messageSession = messageSession;
-        _logger = logger;
+        _submitter = submitter;
     }
 
     [HttpPost("submit")]
-    public async Task<IActionResult> SubmitPaymentAsync([FromBody] PaymentRequest paymentRequest)
+    [ProducesResponseType<PaymentSubmission>(StatusCodes.Status202Accepted)]
+    [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> SubmitPaymentAsync(
+        [FromBody] PaymentRequest paymentRequest,
+        CancellationToken cancellationToken)
     {
-        _logger.LogInformation("[{PaymentId}] Payment saved to DATABASE (simulated)...", paymentRequest.PaymentId);
-
-        await _messageSession.Publish(new PaymentReceivedEvent
+        var errors = PaymentRequestValidator.Validate(paymentRequest);
+        if (errors.Count > 0)
         {
-            PaymentId = paymentRequest.PaymentId,
-            Amount = paymentRequest.Amount,
-            Currency = paymentRequest.Currency,
-            PaymentType = paymentRequest.PaymentMethod.Type,
-            CardLast4 = paymentRequest.PaymentMethod.CardLast4,
-            CardBrand = paymentRequest.PaymentMethod.CardBrand,
-            CustomerId = paymentRequest.Customer.CustomerId,
-            Reference = paymentRequest.Reference
-        });
+            return ValidationProblem(new ValidationProblemDetails(errors));
+        }
 
-        return Ok("Payment submitted successfully.");
+        var submission = await _submitter.SubmitAsync(paymentRequest, cancellationToken);
+
+        return Accepted(submission);
     }
 }

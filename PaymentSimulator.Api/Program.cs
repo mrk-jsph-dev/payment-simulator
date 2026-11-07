@@ -1,9 +1,11 @@
 using PaymentSimulator.Api.GraphQL;
+using PaymentSimulator.Api.Payments;
 using PaymentSimulator.API.Configurations;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddControllers();
+builder.Services.AddScoped<PaymentSubmitter>();
 
 builder.Services.AddOpenApi();
 builder.Services.AddGraphQLServer()

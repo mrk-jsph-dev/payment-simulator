@@ -1,27 +1,28 @@
 ﻿using PaymentSimulator.Api.Contracts;
-using PaymentSimulator.Events;
+using PaymentSimulator.Api.Payments;
 
 namespace PaymentSimulator.Api.GraphQL;
 
 [MutationType]
 public partial class Mutation
 {
-    public async Task<string> SubmitPayment(PaymentRequest paymentRequest, [Service] IMessageSession messageSession, [Service] ILogger<Mutation> logger)
+    public async Task<PaymentSubmission> SubmitPayment(
+        PaymentRequest paymentRequest,
+        [Service] PaymentSubmitter submitter,
+        CancellationToken cancellationToken)
     {
-        logger.LogInformation("[{PaymentId}] Payment saved to DATABASE (simulated)...", paymentRequest.PaymentId);
-
-        await messageSession.Publish(new PaymentReceivedEvent
+        var errors = PaymentRequestValidator.Validate(paymentRequest);
+        if (errors.Count > 0)
         {
-            PaymentId = paymentRequest.PaymentId,
-            Amount = paymentRequest.Amount,
-            Currency = paymentRequest.Currency,
-            PaymentType = paymentRequest.PaymentMethod.Type,
-            CardLast4 = paymentRequest.PaymentMethod.CardLast4,
-            CardBrand = paymentRequest.PaymentMethod.CardBrand,
-            CustomerId = paymentRequest.Customer.CustomerId,
-            Reference = paymentRequest.Reference
-        });
+            throw new GraphQLException(errors
+                .SelectMany(error => error.Value.Select(message => ErrorBuilder.New()
+                    .SetMessage(message)
+                    .SetCode("VALIDATION_ERROR")
+                    .SetExtension("field", error.Key)
+                    .Build()))
+                .ToArray());
+        }
 
-        return "Payment submitted successfully.";
+        return await submitter.SubmitAsync(paymentRequest, cancellationToken);
     }
 }

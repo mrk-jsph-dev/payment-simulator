@@ -1,14 +1,25 @@
 ﻿using Microsoft.Extensions.Logging;
 using PaymentSimulator.Events;
-using PaymentSimulator.ServiceBus.Contracts;
+using PaymentSimulator.ServiceBus.Messages;
 
 namespace PaymentSimulator.ServiceBus.Payment;
 
+/// <summary>
+/// Orchestrates one payment, keyed by <see cref="PaymentReceivedEvent.PaymentId"/>.
+/// The saga only makes decisions and keeps state; the call to the payment gateway
+/// happens in <see cref="ChargeCardHandler"/>, which replies with the result.
+/// </summary>
 public class PaymentSagaPolicy : Saga<PaymentSagaPolicyData>,
     IAmStartedByMessages<PaymentReceivedEvent>,
-    IHandleMessages<PaymentSuccessEvent>,
-    IHandleMessages<PaymentFailedEvent>
+    IHandleMessages<ChargeCardResult>,
+    IHandleTimeouts<DuplicateWindowExpired>
 {
+    /// <summary>
+    /// How long a finished payment is remembered, so a repeated request with the same
+    /// PaymentId is skipped instead of charged again.
+    /// </summary>
+    public static readonly TimeSpan DuplicateWindow = TimeSpan.FromHours(24);
+
     private readonly ILogger<PaymentSagaPolicy> _logger;
 
     public PaymentSagaPolicy(ILogger<PaymentSagaPolicy> logger)
@@ -20,97 +31,95 @@ public class PaymentSagaPolicy : Saga<PaymentSagaPolicyData>,
     {
         mapper.MapSaga(sagaData => sagaData.PaymentId)
             .ToMessage<PaymentReceivedEvent>(message => message.PaymentId)
-            .ToMessage<PaymentSuccessEvent>(message => message.PaymentId)
-            .ToMessage<PaymentFailedEvent>(message => message.PaymentId);
+            .ToMessage<ChargeCardResult>(message => message.PaymentId);
     }
+
     public async Task Handle(PaymentReceivedEvent message, IMessageHandlerContext context)
     {
-        if(Data.IsPaymentProcessed)
+        if (Data.Status != PaymentStatus.New)
         {
-            _logger.LogWarning("[{PaymentId}] Duplicate request skipped (idempotent)", message.PaymentId);
+            _logger.LogWarning(
+                "[{PaymentId}] Duplicate request skipped (idempotent), payment is already {Status}",
+                message.PaymentId,
+                Data.Status);
 
             return;
         }
 
-        var result = await SimulateStripeAsync(message);
+        Data.Status = PaymentStatus.Processing;
+        Data.Amount = message.Amount;
+        Data.Currency = message.Currency;
 
-        if(result.IsSuccess)
+        _logger.LogInformation("[{PaymentId}] Payment received, charging card", message.PaymentId);
+
+        await context.SendLocal(new ChargeCard
         {
-            Data.IsPaymentProcessed = true;
-            _logger.LogInformation("[{PaymentId}] Payment processed successfully", message.PaymentId);
+            PaymentId = message.PaymentId,
+            Amount = message.Amount,
+            Currency = message.Currency,
+            CardBrand = message.CardBrand,
+            CardLast4 = message.CardLast4
+        });
+    }
+
+    public async Task Handle(ChargeCardResult message, IMessageHandlerContext context)
+    {
+        if (Data.Status != PaymentStatus.Processing)
+        {
+            _logger.LogWarning(
+                "[{PaymentId}] Gateway result ignored, payment is already {Status}",
+                message.PaymentId,
+                Data.Status);
+
+            return;
+        }
+
+        if (message.IsSuccess)
+        {
+            Data.Status = PaymentStatus.Succeeded;
+            _logger.LogInformation("[{PaymentId}] Payment succeeded", message.PaymentId);
 
             await context.Publish(new PaymentSuccessEvent
             {
                 PaymentId = message.PaymentId,
-                Amount = message.Amount,
-                Currency = message.Currency
+                Amount = Data.Amount,
+                Currency = Data.Currency
             });
         }
         else
         {
-            _logger.LogError("[{PaymentId}] Payment processing failed: {Reason}", message.PaymentId, result.FailureReason);
+            Data.Status = PaymentStatus.Failed;
+            _logger.LogWarning(
+                "[{PaymentId}] Payment failed: {Reason}",
+                message.PaymentId,
+                message.FailureReason);
 
             await context.Publish(new PaymentFailedEvent
             {
                 PaymentId = message.PaymentId,
-                Amount = message.Amount,
-                Currency = message.Currency,
-                FailureReason = "Sample failed reason: Card was locked."
+                Amount = Data.Amount,
+                Currency = Data.Currency,
+                FailureReason = message.FailureReason ?? "Unknown failure"
             });
         }
-        return;
+
+        // Keep the saga for a while so duplicates are still detected, then end it.
+        await RequestTimeout<DuplicateWindowExpired>(context, DuplicateWindow);
     }
 
-    private async Task<StripeSimulationResult> SimulateStripeAsync(PaymentReceivedEvent message)
+    public Task Timeout(DuplicateWindowExpired state, IMessageHandlerContext context)
     {
-        // Simulate network delay (realistic)
-        await Task.Delay(1000);
-
-        // Random success/failure
-        var isSuccess = Random.Shared.Next(0, 10) > 2;
-
-        if (isSuccess)
-        {
-            _logger.LogInformation(
-                "[{PaymentId}] Stripe simulation SUCCESS for {Amount} {Currency} ({CardBrand} ****{Last4})",
-                message.PaymentId,
-                message.Amount,
-                message.Currency,
-                message.CardBrand,
-                message.CardLast4
-            );
-
-            return StripeSimulationResult.Success();
-        }
-
-        var reason = "Insufficient funds";
-
-        _logger.LogWarning(
-            "[{PaymentId}] Stripe simulation FAILED: {Reason}",
-            message.PaymentId,
-            reason
-        );
-
-        return StripeSimulationResult.Failure(reason);
-    }
-
-    public Task Handle(PaymentSuccessEvent message, IMessageHandlerContext context)
-    {
-        _logger.LogInformation("[{PaymentId}] Payment successfully cleared!", message.PaymentId);
-
-        _logger.LogInformation("[{PaymentId}] Marking payment as COMPLETED", message.PaymentId);
-
-        _logger.LogInformation("[{PaymentId}] Sending receipt email (simulated)", message.PaymentId);
+        _logger.LogInformation(
+            "[{PaymentId}] Duplicate window over, saga completed ({Status})",
+            Data.PaymentId,
+            Data.Status);
 
         MarkAsComplete();
 
         return Task.CompletedTask;
     }
+}
 
-    public Task Handle(PaymentFailedEvent message, IMessageHandlerContext context)
-    {
-        _logger.LogWarning("[{PaymentId}] Notifying customer of failure... [{FailureReason}]", message.PaymentId, message.FailureReason);
-
-        return Task.CompletedTask;
-    }
+public class DuplicateWindowExpired
+{
 }
