@@ -16,7 +16,40 @@ It shows:
 
 ## Architecture
 
-![Architecture diagram](PaymentSimulator.png)
+Two processes talk only through messages. The API accepts a request and publishes an event; the
+NServiceBus endpoint does the rest.
+
+```mermaid
+flowchart LR
+    client([Client])
+
+    subgraph api["PaymentSimulator.Api"]
+        rest["REST<br/>POST /api/payment/submit"]
+        gql["GraphQL<br/>submitPayment"]
+        submitter["PaymentSubmitter<br/>validate, save (simulated)"]
+        rest --> submitter
+        gql --> submitter
+    end
+
+    transport[("LearningTransport<br/>local folder")]
+
+    subgraph endpoint["PaymentSimulator.ServiceBus"]
+        saga["PaymentSagaPolicy<br/>one saga per PaymentId"]
+        charge["ChargeCardHandler"]
+        gateway["SimulatedPaymentGateway"]
+        notify["CustomerNotificationHandler<br/>emails (simulated)"]
+        saga -- "ChargeCard" --> charge
+        charge --> gateway
+        charge -- "ChargeCardResult (reply)" --> saga
+    end
+
+    client --> rest
+    client --> gql
+    submitter -- "publish PaymentReceivedEvent" --> transport
+    transport --> saga
+    saga -- "publish PaymentSuccessEvent<br/>or PaymentFailedEvent" --> transport
+    transport --> notify
+```
 
 | Project                       | What it does                                                         |
 | ----------------------------- | -------------------------------------------------------------------- |
@@ -27,21 +60,33 @@ It shows:
 
 ## Event flow
 
-```text
-Client ──► REST POST /api/payment/submit  or  GraphQL submitPayment
-             │  validate, save (simulated), publish PaymentReceivedEvent, return 202 Accepted
-             ▼
-PaymentSagaPolicy (one saga per PaymentId)
-             │  already seen this PaymentId? ──► skip (idempotent)
-             │  send ChargeCard
-             ▼
-ChargeCardHandler ──► simulated gateway ──► reply ChargeCardResult
-             ▼
-PaymentSagaPolicy
-             │  publish PaymentSuccessEvent or PaymentFailedEvent
-             │  keep the saga for 24 hours so duplicates are still caught, then complete
-             ▼
-CustomerNotificationHandler ──► receipt or failure email (simulated)
+One payment, from request to notification:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant A as API (REST or GraphQL)
+    participant S as PaymentSagaPolicy
+    participant H as ChargeCardHandler
+    participant G as Simulated gateway
+    participant N as CustomerNotificationHandler
+
+    C->>A: submit payment
+    A->>A: validate, "save" (simulated)
+    A-)S: publish PaymentReceivedEvent
+    A-->>C: 202 Accepted
+    alt PaymentId already seen
+        S->>S: skip (idempotent)
+    else new payment
+        S-)H: send ChargeCard
+        H->>G: charge
+        G-->>H: success or failure
+        H-)S: reply ChargeCardResult
+        S-)N: publish PaymentSuccessEvent or PaymentFailedEvent
+        N->>N: log receipt or failure email (simulated)
+        S->>S: keep saga 24 hours to catch duplicates, then complete
+    end
 ```
 
 ## How to run
@@ -128,18 +173,32 @@ Sending the same request again:
 [3fa85f64-...] Duplicate request skipped (idempotent), payment is already Succeeded
 ```
 
-## What is simulated
+## What's simulated
 
-- **Database**: the API only logs "saved". Nothing is stored apart from saga state.
-- **Payment gateway**: `SimulatedPaymentGateway` waits one second and answers from the test card table above.
-- **Emails**: log lines.
-- **Transport and persistence**: LearningTransport and LearningPersistence, for local use only.
+This is a personal proof of concept. No real money, cards or customer data are involved.
 
-## Not built yet
+| Part                          | In this repo                                                                  | Not here                       |
+| ----------------------------- | ----------------------------------------------------------------------------- | ------------------------------ |
+| Payment gateway               | `SimulatedPaymentGateway` waits one second and answers from the test card table above. | Any real payment provider |
+| Database                      | The API only logs "saved". Nothing is stored apart from saga state.           | A real database                |
+| Customer emails               | Log lines.                                                                    | Sending email                  |
+| Message transport             | NServiceBus LearningTransport: files in a local `.learningtransport` folder.  | A message broker               |
+| Saga persistence              | NServiceBus LearningPersistence, also local files.                            | A production saga store        |
+| Card details                  | Only a brand and the last four digits, used to pick the test result.          | Card numbers, CVV or tokens    |
 
-- An outbox. Today the API "saves" and publishes as two separate steps, so a crash between them could lose or duplicate a message.
-- A real broker (such as RabbitMQ or Azure Service Bus) and end-to-end tests against it with Testcontainers.
-- A query to read a payment's status.
+What is real: the NServiceBus message handling, the saga and its state changes, the duplicate
+check by `PaymentId`, the 24-hour timeout, request validation, and the tests.
+
+## What I'd add next
+
+Future work. None of this is built yet.
+
+- **Outbox.** Today the API "saves" and publishes as two separate steps, so a crash between them
+  could lose or duplicate a message. NServiceBus's outbox, with a real database, would make the
+  save and the publish one unit.
+- **A real broker.** Swap LearningTransport for RabbitMQ or Azure Service Bus, and add
+  end-to-end tests against it with Testcontainers.
+- **A status query.** A REST and GraphQL query to read a payment's current status.
 
 ## Tech
 
